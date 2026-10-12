@@ -1,0 +1,64 @@
+# Supabase 휴면 방지 (GitHub Actions)
+# 저장 위치: 저장소의 .github/workflows/supabase-keepalive.yml
+#
+# 저장소 Settings → Secrets and variables → Actions 에 등록:
+#   SUPABASE_URL       https://<프로젝트ref>.supabase.co
+#   SUPABASE_ANON_KEY  anon(public) 키
+#   KEEPALIVE_TABLE    핑할 테이블 이름 (예: products) — 앱에서 쓰는 아무 테이블
+#
+# 하는 일
+#   1) 2일마다 DB에 아주 가벼운 읽기 요청(1행)을 보내 '7일간 활동 없음'이 되지 않게 함
+#   2) GitHub는 활동 없는 저장소의 예약 작업을 60일 뒤 꺼 버리므로,
+#      마지막 커밋이 45일 넘으면 작은 기록 파일(.github/keepalive.txt)을 커밋해 예약을 살려 둠
+
+name: Supabase keep-alive
+
+on:
+  schedule:
+    - cron: '17 0 */2 * *'   # 2일마다 (UTC 00:17 = 한국 09:17)
+  workflow_dispatch:          # Actions 탭에서 수동 실행 버튼
+
+permissions:
+  contents: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          KEEPALIVE_TABLE: ${{ secrets.KEEPALIVE_TABLE }}
+        run: |
+          set -e
+          url="${SUPABASE_URL%/}/rest/v1/${KEEPALIVE_TABLE}?select=*&limit=1"
+          for i in 1 2 3; do
+            code=$(curl -s -o /tmp/out.json -w '%{http_code}' \
+              -H "apikey: ${SUPABASE_ANON_KEY}" -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" "$url")
+            echo "시도 $i → HTTP $code"
+            if [ "$code" = "200" ] || [ "$code" = "206" ]; then echo "✅ Supabase 깨어 있음"; exit 0; fi
+            sleep 20
+          done
+          echo "❌ 응답 이상 (HTTP $code) — 이미 휴면이거나 테이블 이름/키를 확인하세요"
+          cat /tmp/out.json || true
+          exit 1
+
+      - name: Checkout
+        if: always()
+        uses: actions/checkout@v4
+      - name: Keep this schedule alive (60일 자동 중지 방지)
+        if: always()
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          days=$(( (now - last) / 86400 ))
+          echo "마지막 커밋 후 ${days}일"
+          if [ "$days" -ge 45 ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/keepalive.txt
+            git config user.name "keepalive-bot"
+            git config user.email "keepalive-bot@users.noreply.github.com"
+            git add .github/keepalive.txt
+            git commit -m "chore: keep-alive"
+            git push
+          fi
